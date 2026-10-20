@@ -22,9 +22,10 @@ import { EcovacsRoboticVacuumAccessory } from './devices/index.js'
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js'
 import platformConsts from './utils/constants.js'
 import platformChars from './utils/custom-chars.js'
-import { matterPollInterval, parseError, sleep } from './utils/functions.js'
+import { applyV2Override, matterPollInterval, parseError, sleep } from './utils/functions.js'
 import platformLang from './utils/lang-en.js'
 import { quietEcovacsEventLogging } from './utils/quiet-library-logging.js'
+import { isWorkStateDevice } from './utils/work-state.js'
 
 const require = createRequire(import.meta.url)
 const plugin = require('../package.json')
@@ -1035,14 +1036,14 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
       }
 
       // Load the device control information from Ecovacs/Yeedi
-      const loadedDevice = this.ecovacsAPI.getVacBot(
+      const loadedDevice = applyV2Override(this.ecovacsAPI.getVacBot(
         this.ecovacsAPI.uid,
         EcoVacsAPI.REALM,
         this.deviceClientResource(device),
         this.ecovacsAPI.user_access_token,
         device,
         countries[this.config.countryCode].continent,
-      )
+      ))
 
       // Get the cached accessory or add to Homebridge if it doesn't exist
       const accessory
@@ -1537,14 +1538,14 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
       }
 
       // Load the device control object from Ecovacs/Yeedi
-      const loadedDevice = this.ecovacsAPI.getVacBot(
+      const loadedDevice = applyV2Override(this.ecovacsAPI.getVacBot(
         this.ecovacsAPI.uid,
         EcoVacsAPI.REALM,
         this.deviceClientResource(device),
         this.ecovacsAPI.user_access_token,
         device,
         countries[this.config.countryCode].continent,
-      )
+      ))
 
       // Create and store the Matter accessory
       const matterVacuum = new EcovacsRoboticVacuumAccessory(
@@ -1556,6 +1557,7 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
           company: device.company,
           model: device.deviceModel,
           isV2: loadedDevice.is950type_V2(),
+          usesWorkState: isWorkStateDevice(device.class),
         },
       )
       this.matterVacuumMap.set(device.did, matterVacuum)
@@ -1581,9 +1583,7 @@ export class EcovacsPlatform implements DynamicPlatformPlugin {
         this.refreshIntervals[device.did] = setInterval(() => {
           loadedDevice.run?.('GetBatteryState')
           loadedDevice.run?.('GetChargeState')
-          loadedDevice.run?.(
-            `GetCleanState${loadedDevice.is950type_V2() ? '_V2' : ''}`,
-          )
+          matterVacuum.requestCleanState()
           loadedDevice.run?.('GetCleanSpeed')
         }, pollInterval * 1000)
       }

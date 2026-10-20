@@ -46,4 +46,25 @@ function matterPollInterval(configured?: number): number {
   return DEFAULT_MATTER_POLL_INTERVAL
 }
 
-export { DEFAULT_MATTER_POLL_INTERVAL, matterPollInterval, parseError, sleep }
+// Device classes that only answer the V2 command set but are missing from the
+// stable ecovacs-deebot model list, which therefore reports them as V1. Sending
+// them GetCleanState/Clean gets no reply at all, so the clean state never
+// updates and the vacuum cannot be started.
+//   6801mm - Yeedi M14 Plus
+const V2_DEVICE_CLASSES = new Set(['6801mm'])
+
+/**
+ * Make an unrecognised V2 vacbot report itself as V2, so both the HAP command
+ * suffix and the Matter accessory pick the commands the robot answers to.
+ *
+ * @param vacBot the control object returned by `getVacBot`
+ * @returns the same control object
+ */
+function applyV2Override(vacBot) {
+  if (V2_DEVICE_CLASSES.has(vacBot?.deviceClass) && !vacBot.is950type_V2()) {
+    vacBot.is950type_V2 = () => true
+  }
+  return vacBot
+}
+
+export { applyV2Override, DEFAULT_MATTER_POLL_INTERVAL, matterPollInterval, parseError, sleep, V2_DEVICE_CLASSES }

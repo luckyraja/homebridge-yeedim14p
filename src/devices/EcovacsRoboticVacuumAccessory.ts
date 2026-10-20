@@ -18,11 +18,37 @@
  *   rvcOperationalState.pause → run('Pause')
  *   rvcOperationalState.resume → run('Clean' | 'Clean_V2')
  *   rvcOperationalState.goHome → run('Charge')
+ *
+ * Robots that report their state through getWorkState (see utils/work-state.ts)
+ * differ throughout:
+ *   rvcOperationalState ← getWorkState + getChargeState + getError, with the
+ *                         station's emptying / mop washing and specific errors
+ *   rvcCleanMode ← getWorkMode (Vacuum & Mop / Vacuum / Mop / Mop after Vacuum)
+ *   serviceArea ← rooms of the robot's current map, from getMapSet_V2
+ *   pause / resume / goHome → clean_V2 pause / resume / stop (+ Charge)
+ *   rvcRunMode.changeToMode (1=Cleaning) → the selected rooms, or everywhere
  */
 
 import type { API, Logger, MatterRequests } from 'homebridge'
 
+import type { WorkState } from '../utils/work-state.js'
+
 import platformLang from '../utils/lang-en.js'
+import {
+  errorCodesToMatter,
+  OpError,
+  OpState,
+  parseErrorCodes,
+  parseRooms,
+  parseWorkMode,
+  parseWorkState,
+  requestRooms,
+  requestWorkState,
+  tapMessages,
+  WORK_MODES,
+  workStateCommands,
+  workStateToMatter,
+} from '../utils/work-state.js'
 import { BaseMatterAccessory } from './BaseMatterAccessory.js'
 
 /** Ecovacs clean-state values that indicate the vacuum is actively cleaning. */
@@ -51,6 +77,8 @@ export interface EcovacsDeviceInfo {
   fwVersion?: string
   /** Whether the device uses V2 commands (950-type). */
   isV2?: boolean
+  /** Whether the device reports its state through getWorkState. */
+  usesWorkState?: boolean
 }
 
 /**
@@ -63,6 +91,19 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
   private control: any = null
 
   private readonly isV2?: boolean
+
+  private readonly usesWorkState: boolean = false
+
+  // Work-state robots only: the latest of each input to the operational state
+  private lastWorkState?: WorkState
+  private charging = false
+  private robotErrors: number[] = []
+  /** The map whose rooms are offered, as the robot's own id string */
+  private currentMapId?: string
+  /** Set when the robot stops answering, until it next reports its state */
+  private offline = false
+  /** Operational state updates in progress, run one at a time */
+  private applying: Promise<void> = Promise.resolve()
 
   /** Tracked so we can guard handler state checks. */
   private currentOperationalState = 66 // start docked
@@ -125,10 +166,12 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
         // driven by Ecovacs CleanSpeed events. The device does not yet report
         // Mop / Vacuum & Mop modes, so omitted to avoid a stale state.
         rvcCleanMode: {
-          supportedModes: [
-            { label: 'Vacuum', mode: 0, modeTags: [{ value: 16385 }] },
-            { label: 'Max Clean', mode: 3, modeTags: [{ value: 7 }, { value: 16385 }] },
-          ],
+          supportedModes: device.usesWorkState
+            ? WORK_MODES
+            : [
+                { label: 'Vacuum', mode: 0, modeTags: [{ value: 16385 }] },
+                { label: 'Max Clean', mode: 3, modeTags: [{ value: 7 }, { value: 16385 }] },
+              ],
           currentMode: 0,
         },
 
@@ -142,6 +185,12 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
             { operationalStateId: 64 }, // SeekingCharger
             { operationalStateId: 65 }, // Charging
             { operationalStateId: 66 }, // Docked
+            ...(device.usesWorkState
+              ? [
+                  { operationalStateId: OpState.EmptyingDustBin },
+                  { operationalStateId: OpState.CleaningMop },
+                ]
+              : []),
           ],
           operationalState: 66, // start docked
         },
@@ -187,6 +236,7 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
     })
 
     this.isV2 = isV2
+    this.usesWorkState = device.usesWorkState ?? false
     this.logInfo('Matter accessory initialized (waiting for device connection).')
   }
 
@@ -201,6 +251,18 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
   public connectControl(control: any): void {
     this.control = control
 
+    if (this.usesWorkState) {
+      const tapped = tapMessages(control, {
+        WorkState: data => void this.onWorkState(parseWorkState(data)),
+        Error: data => void this.onRobotErrors(parseErrorCodes(data)),
+        WorkMode: data => void this.onWorkMode(parseWorkMode(data)),
+        MapSet_V2: data => void this.onRooms(data),
+      })
+      if (!tapped) {
+        this.logWarn('cannot read work state from this device - its status will not update')
+      }
+    }
+
     // ── Device ready: fetch initial state ────────────────────────────
     control.on('ready', (event: boolean) => {
       if (!event) {
@@ -209,9 +271,12 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
       this.logDebug('Device ready — requesting initial state.')
       control.run('GetBatteryState')
       control.run('GetChargeState')
-      control.run(this.isV2 ? 'GetCleanState_V2' : 'GetCleanState')
+      this.requestCleanState()
       control.run('GetCleanSpeed')
       control.run('GetMaps')
+      if (this.usesWorkState) {
+        control.run('Generic', ...workStateCommands.getWorkMode)
+      }
     })
 
     control.on('CleanReport', (newVal: string) => void this.onCleanReport(newVal))
@@ -221,7 +286,26 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
 
     // ── Error / offline detection ──────────────────────────────────
     control.on('Error', (err: string) => {
-      if (err === 'NoError: Robot is operational') {
+      // Work-state robots' errors are read from their own error messages - the
+      // library also raises this event for its own failures, such as a map
+      // message it cannot decode, which are not the robot's. Losing the robot
+      // altogether is the exception
+      if (this.usesWorkState) {
+        if (err === 'Recipient unavailable' && !this.offline) {
+          this.offline = true
+          this.logWarn('Device appears to be offline.')
+          void this.applyWorkState()
+        }
+        return
+      }
+      // A robot clearing its errors reports an empty code list, which the
+      // library words as an unknown error with no code
+      if (err === 'NoError: Robot is operational' || err === 'unknown errorCode: ') {
+        if (this.currentOperationalState === 3) {
+          this.lastReportedError = ''
+          this.requestCleanState()
+          control.run('GetChargeState')
+        }
         return
       }
       // The optional canvas module only draws map images, which HomeKit
@@ -250,6 +334,20 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
       if (!data?.maps) {
         return
       }
+      // A work-state robot can only clean the rooms of the map it is on, and
+      // only lists them through getMapSet_V2
+      if (this.usesWorkState) {
+        const current: any = Object.values(data.maps).find((m: any) => m.mapIsCurrentMap)
+        const mapId = Number(current?.mapID)
+        if (!current || Number.isNaN(mapId)) {
+          return
+        }
+        this.mapsById.clear()
+        this.mapsById.set(mapId, current.mapName || `Map ${current.mapID}`)
+        this.currentMapId = String(current.mapID)
+        requestRooms(control, this.currentMapId)
+        return
+      }
       // Register each map and request its spot areas
       Object.values(data.maps).forEach((m: any) => {
         const mapId = Number(m.mapID)
@@ -263,7 +361,9 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
     })
 
     control.on('MapSpotAreas', (data: any) => {
-      if (!data?.mapSpotAreas) {
+      // The library cannot decode a work-state robot's room list and reports it
+      // as a long run of empty areas - its rooms come from onRooms instead
+      if (this.usesWorkState || !data?.mapSpotAreas) {
         return
       }
       // Request full info for each area
@@ -273,7 +373,7 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
     })
 
     control.on('MapSpotAreaInfo', (area: any) => {
-      if (!area?.mapSpotAreaID) {
+      if (this.usesWorkState || !area?.mapSpotAreaID) {
         return
       }
       const areaId = Number(area.mapSpotAreaID)
@@ -299,6 +399,10 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
 
   /** Maps Ecovacs CleanReport values to Matter rvcRunMode + rvcOperationalState. */
   private async onCleanReport(newVal: string): Promise<void> {
+    // Work-state robots answer 'idle' here even mid-clean
+    if (this.usesWorkState) {
+      return
+    }
     if (!newVal) {
       this.logDebug('CleanReport received with empty value, ignoring')
       return
@@ -322,6 +426,11 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
       this.logDebug('ChargeState received with empty value, ignoring')
       return
     }
+    if (this.usesWorkState) {
+      this.charging = newVal.toLowerCase() === 'charging'
+      await this.applyWorkState()
+      return
+    }
     switch (newVal.toLowerCase()) {
       case 'returning':
         await this.updateRunMode(0) // Idle
@@ -331,12 +440,101 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
         await this.updateOperationalState(65) // Charging
         break
       case 'idle':
-      // Docked & charged
+        // Docked & charged
         await this.updateOperationalState(66) // Docked
         break
       default:
         this.logDebug(`unrecognised ChargeState: ${newVal}`)
     }
+  }
+
+  /** Work-state robots: the robot's own report of what it is doing. */
+  private async onWorkState(state?: WorkState): Promise<void> {
+    if (!state) {
+      return
+    }
+    this.offline = false
+    this.lastWorkState = state
+    await this.applyWorkState()
+  }
+
+  /** Work-state robots: the robot's active error codes, empty once cleared. */
+  private async onRobotErrors(codes?: number[]): Promise<void> {
+    if (!codes) {
+      return
+    }
+    const key = codes.join(',')
+    if (key !== this.robotErrors.join(',')) {
+      if (codes.length > 0) {
+        this.logWarn(`Device error: ${key}`)
+      } else {
+        this.logInfo('Device error cleared.')
+        // The robot resumes on its own once the cause is fixed
+        this.requestCleanState()
+      }
+    }
+    this.robotErrors = codes
+    await this.applyWorkState()
+  }
+
+  /** Work-state robots: the vacuum / mop mode. */
+  private async onWorkMode(mode?: number): Promise<void> {
+    if (mode !== undefined) {
+      await this.updateState('rvcCleanMode', { currentMode: mode })
+    }
+  }
+
+  /** Work-state robots: the rooms of the current map. */
+  private async onRooms(data: any): Promise<void> {
+    if (data?.type !== 'ar' || String(data.mid) !== this.currentMapId) {
+      return
+    }
+    const rooms = parseRooms(data)
+    if (!rooms) {
+      this.logWarn('cannot read the room list (needs Node 22.15 or later) - rooms will not be offered')
+      return
+    }
+    const mapId = Number(this.currentMapId)
+    this.areasById.clear()
+    for (const room of rooms) {
+      this.areasById.set(room.areaId, { mapId, name: room.name })
+    }
+    this.logDebug(`rooms: ${rooms.map(r => `${r.areaId}=${r.name}`).join(', ')}`)
+    await this.flushServiceAreas()
+  }
+
+  /**
+   * Work-state robots: set the operational state from everything the robot last
+   * reported. The robot sends its work state and errors together, so updates
+   * run one at a time - each from the latest of both - or an earlier one could
+   * land last and hide an error.
+   */
+  private applyWorkState(): Promise<void> {
+    this.applying = this.applying
+      .then(() => this.writeWorkState())
+      .catch(err => this.logWarn(`could not update state: ${err instanceof Error ? err.message : err}`))
+    return this.applying
+  }
+
+  private async writeWorkState(): Promise<void> {
+    if (this.offline) {
+      await this.updateOperationalState(OpState.Error, OpError.UnableToCompleteOperation)
+      return
+    }
+    if (this.robotErrors.length > 0) {
+      await this.updateOperationalState(OpState.Error, errorCodesToMatter(this.robotErrors))
+      return
+    }
+    if (!this.lastWorkState) {
+      return
+    }
+    const matter = workStateToMatter(this.lastWorkState, this.charging)
+    if (!matter) {
+      this.logDebug(`unrecognised work state: ${JSON.stringify(this.lastWorkState)}`)
+      return
+    }
+    await this.updateRunMode(matter.runMode)
+    await this.updateOperationalState(matter.operationalState, 0)
   }
 
   private async onBatteryInfo(newVal: number): Promise<void> {
@@ -357,6 +555,10 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
 
   /** Maps Ecovacs CleanSpeed to Matter rvcCleanMode. */
   private async onCleanSpeed(newVal: number): Promise<void> {
+    // Work-state robots' clean modes are their work modes, not suction
+    if (this.usesWorkState) {
+      return
+    }
     // Speed 3 or 4 → Max Clean (mode 3); else → Vacuum (mode 0)
     const cleanMode = [3, 4].includes(newVal) ? 3 : 0
     await this.updateState('rvcCleanMode', { currentMode: cleanMode })
@@ -369,6 +571,14 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
   private async handleChangeRunMode(request: MatterRequests.ChangeToMode): Promise<void> {
     this.logInfo(`rvcRunMode.changeToMode → ${request.newMode}`)
     if (!this.isDeviceReady()) {
+      return
+    }
+    if (this.usesWorkState && [0, 1, 2].includes(request.newMode)) {
+      if (request.newMode === 0) {
+        await this.handleGoHome()
+      } else {
+        await this.startWorkStateClean()
+      }
       return
     }
     switch (request.newMode) {
@@ -391,6 +601,15 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
     if (!this.isDeviceReady()) {
       return
     }
+    if (this.usesWorkState) {
+      if (parseWorkMode({ mode: request.newMode }) === undefined) {
+        this.logWarn(`unsupported clean mode: ${request.newMode}`)
+        return
+      }
+      this.control.run('Generic', ...workStateCommands.setWorkMode(request.newMode))
+      await this.updateState('rvcCleanMode', { currentMode: request.newMode })
+      return
+    }
     switch (request.newMode) {
       case 0: // Vacuum (standard) → speed 2
         this.control.run('SetCleanSpeed', 2)
@@ -408,7 +627,11 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
     if (!this.isDeviceReady()) {
       return
     }
-    this.control.run('Pause')
+    if (this.usesWorkState) {
+      this.control.run('Generic', ...workStateCommands.pause)
+    } else {
+      this.control.run('Pause')
+    }
     await this.updateOperationalState(2) // Paused
   }
 
@@ -417,7 +640,11 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
     if (!this.isDeviceReady()) {
       return
     }
-    this.control.run('Resume')
+    if (this.usesWorkState) {
+      this.control.run('Generic', ...workStateCommands.resume)
+    } else {
+      this.control.run('Resume')
+    }
     await this.updateRunMode(1) // Cleaning
     await this.updateOperationalState(1) // Running
   }
@@ -427,7 +654,14 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
     if (!this.isDeviceReady()) {
       return
     }
-    this.control.run('Charge')
+    if (this.usesWorkState) {
+      // Charge alone docks with the clean still paused, to be resumed later -
+      // end it first so going home means done, as it does in Home
+      this.control.run('Generic', ...workStateCommands.stop)
+      setTimeout(() => this.control?.run('Charge'), 1000)
+    } else {
+      this.control.run('Charge')
+    }
     await this.updateRunMode(0) // Idle
     await this.updateOperationalState(64) // SeekingCharger
   }
@@ -435,6 +669,20 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
   private async handleSelectAreas(request: MatterRequests.SelectAreas): Promise<void> {
     this.logInfo(`serviceArea.selectAreas → ${JSON.stringify(request.newAreas)}`)
     if (!this.isDeviceReady()) {
+      return
+    }
+
+    // As Matter intends, choosing rooms only selects them - the clean starts
+    // when the run mode changes to Cleaning
+    if (this.usesWorkState) {
+      const selected = (request.newAreas ?? []).filter((areaId) => {
+        if (!this.areasById.has(areaId)) {
+          this.logWarn(`selectAreas: unknown area ID ${areaId}, skipping`)
+          return false
+        }
+        return true
+      })
+      await this.updateState('serviceArea', { selectedAreas: selected })
       return
     }
 
@@ -477,6 +725,27 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
     await this.updateOperationalState(1) // Running
   }
 
+  /** Work-state robots: clean the selected rooms, or everywhere if none are selected. */
+  private async startWorkStateClean(): Promise<void> {
+    // Starting a clean that is paused carries on with it, rather than
+    // replacing it with a new one
+    if (this.lastWorkState?.robot === 'cleaning' && this.lastWorkState.paused) {
+      await this.handleResume()
+      return
+    }
+    const state = await this.readState('serviceArea')
+    const selected: number[] = ((state as any)?.selectedAreas ?? [])
+      .filter((areaId: number) => this.areasById.has(areaId))
+    if (selected.length > 0) {
+      this.logDebug(`cleaning rooms: ${selected.join(', ')}`)
+      this.control.run('Generic', ...workStateCommands.cleanRooms(selected))
+    } else {
+      this.control.run('Clean_V2')
+    }
+    await this.updateRunMode(1) // Cleaning
+    await this.updateOperationalState(OpState.Running, 0)
+  }
+
   private async handleSkipArea(request: MatterRequests.SkipArea): Promise<void> {
     this.logInfo(`serviceArea.skipArea → area ${request.skippedArea}`)
     if (!this.isDeviceReady()) {
@@ -501,13 +770,32 @@ export class EcovacsRoboticVacuumAccessory extends BaseMatterAccessory {
   // Public update helpers (callable from the platform for immediate sync)
   // ──────────────────────────────────────────────────────────────────────────
 
-  public async updateOperationalState(state: number): Promise<void> {
+  /**
+   * @param state the Matter operational state
+   * @param errorStateId the Matter error id to report with it, if the device
+   * reports specific errors (0 for none)
+   */
+  public async updateOperationalState(state: number, errorStateId?: number): Promise<void> {
     this.currentOperationalState = state
-    await this.updateState('rvcOperationalState', { operationalState: state })
+    await this.updateState('rvcOperationalState', errorStateId === undefined
+      ? { operationalState: state }
+      : { operationalState: state, operationalError: { errorStateId } })
   }
 
   public async updateRunMode(mode: number): Promise<void> {
     await this.updateState('rvcRunMode', { currentMode: mode })
+  }
+
+  /** Ask the robot whether it is cleaning, in whichever way it reports it. */
+  public requestCleanState(): void {
+    if (!this.control) {
+      return
+    }
+    if (this.usesWorkState) {
+      requestWorkState(this.control)
+    } else {
+      this.control.run(this.isV2 ? 'GetCleanState_V2' : 'GetCleanState')
+    }
   }
 
   /** Push the current map/area data into the Matter serviceArea cluster. */
