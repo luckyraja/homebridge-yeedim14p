@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { HomebridgePluginUiServer } from '@homebridge/plugin-ui-utils'
 
-const PLUGIN_NAME = '@homebridge-plugins/homebridge-ecovacs'
+const PLUGIN_NAME = '@luckyraja/homebridge-yeedim14p'
 
 /**
  * Derives the Matter storage folder name for a given accessory UUID.

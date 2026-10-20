@@ -2,6 +2,22 @@
 
 All notable changes to `@homebridge-plugins/homebridge-ecovacs` will be documented in this file.
 
+## v8.3.0 (2026-10-20) - `@luckyraja/homebridge-yeedim14p` fork
+
+### Added
+
+- Yeedi M14 Plus (`6801mm`) support in Matter mode: status from `getWorkState` including the station's
+  emptying and mop washing, pause / resume / return to dock via `clean_V2`, work modes as clean modes,
+  room cleaning of the current map via `freeClean`, and specific robot errors
+
+### Changed
+
+- Published as `@luckyraja/homebridge-yeedim14p` so upstream updates do not replace it
+
+### Fixed
+
+- A robot clearing its errors (an empty error code) no longer shows as an error
+
 ## v8.2.5 (Pending Release)
 
 ### Changed

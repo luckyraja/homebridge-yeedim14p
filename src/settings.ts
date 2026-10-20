@@ -6,4 +6,4 @@ export const PLATFORM_NAME = 'Deebot'
 /**
  * This must match the name of your plugin as defined the package.json `name` property
  */
-export const PLUGIN_NAME = '@homebridge-plugins/homebridge-ecovacs'
+export const PLUGIN_NAME = '@luckyraja/homebridge-yeedim14p'

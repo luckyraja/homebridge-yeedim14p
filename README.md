@@ -16,6 +16,17 @@ Homebridge plugin to integrate Ecovacs Deebot or Yeedi devices into HomeKit
 
 </span>
 
+> [!NOTE]
+> **This is a fork** of [homebridge-plugins/homebridge-ecovacs](https://github.com/homebridge-plugins/homebridge-ecovacs), published as `@luckyraja/homebridge-yeedim14p` so Homebridge never replaces it with an upstream update. It adds full Matter support for the **Yeedi M14 Plus** (device class `6801mm`), which the upstream plugin can see but not properly control:
+>
+> - status from the robot's work state - cleaning, paused, returning, charging, and the station emptying the bin or washing the mop
+> - pause, resume and return to dock, using the commands this robot obeys
+> - clean modes Vacuum & Mop / Vacuum / Mop / Mop after Vacuum
+> - cleaning selected rooms of the current map
+> - specific errors such as a full dirty water tank
+>
+> Other devices behave exactly as upstream. The badges and wiki links below are the upstream plugin's.
+
 ### Plugin Information
 
 - This plugin allows you to view and control your Ecovacs or Yeedi devices within HomeKit. The plugin:

@@ -1,9 +1,9 @@
 {
-  "name": "@homebridge-plugins/homebridge-ecovacs",
-  "displayName": "Homebridge Ecovacs",
+  "name": "@luckyraja/homebridge-yeedim14p",
+  "displayName": "yeedim14p",
   "alias": "Deebot",
   "type": "module",
-  "version": "8.2.4",
+  "version": "8.3.0",
   "description": "Homebridge plugin to integrate Ecovacs Deebot/Yeedi devices into HomeKit.",
   "author": {
     "name": "bwp91",
@@ -28,13 +28,13 @@
       "url": "https://www.paypal.me/BenPotter"
     }
   ],
-  "homepage": "https://github.com/homebridge-plugins/homebridge-ecovacs",
+  "homepage": "https://github.com/luckyraja/homebridge-yeedim14p",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/homebridge-plugins/homebridge-ecovacs.git"
+    "url": "git+https://github.com/luckyraja/homebridge-yeedim14p.git"
   },
   "bugs": {
-    "url": "https://github.com/homebridge-plugins/homebridge-ecovacs/issues"
+    "url": "https://github.com/luckyraja/homebridge-yeedim14p/issues"
   },
   "keywords": [
     "homebridge",
