@@ -26,6 +26,8 @@ Homebridge plugin to integrate Ecovacs Deebot or Yeedi devices into HomeKit
 > - specific errors such as a full dirty water tank
 >
 > Other devices behave exactly as upstream. The badges and wiki links below are the upstream plugin's.
+>
+> **Personal fork, maintained for my own use only - no support, no issues, and no npm releases.** You are welcome to use or copy it under the MIT licence, but for anything else please use the [upstream plugin](https://github.com/homebridge-plugins/homebridge-ecovacs).
 
 ### Plugin Information
 
